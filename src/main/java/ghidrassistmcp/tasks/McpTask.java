@@ -56,7 +56,8 @@ public class McpTask {
                    McpProgramContext programContext) {
         this.taskId = UUID.randomUUID().toString();
         this.toolName = toolName;
-        this.arguments = arguments;
+        this.arguments = arguments == null ? Map.of() :
+            java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(arguments));
         this.programContext = programContext != null
                 ? programContext
                 : McpProgramContext.empty();
@@ -154,11 +155,19 @@ public class McpTask {
      */
     public synchronized void markCompleted(McpSchema.CallToolResult taskResult) {
         if (this.status == Status.RUNNING || this.status == Status.PENDING || this.status == Status.TIMED_OUT) {
-            this.status = Status.COMPLETED;
+            boolean failed = Boolean.TRUE.equals(taskResult.isError());
+            this.status = failed ? Status.FAILED : Status.COMPLETED;
+            if (failed) {
+                this.errorMessage = taskResult.content().stream()
+                    .filter(McpSchema.TextContent.class::isInstance)
+                    .map(McpSchema.TextContent.class::cast)
+                    .map(McpSchema.TextContent::text)
+                    .findFirst().orElse("Tool execution failed");
+            }
             this.completedAt = Instant.now();
             this.result = taskResult;
             this.progressPercent = 100;
-            this.progressMessage = "Completed";
+            this.progressMessage = failed ? "Failed: " + errorMessage : "Completed";
         }
     }
 

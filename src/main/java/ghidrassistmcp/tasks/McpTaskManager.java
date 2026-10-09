@@ -9,11 +9,13 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -56,6 +58,7 @@ public class McpTaskManager {
 
     private final Map<String, McpTask> tasks = new ConcurrentHashMap<>();
     private final Map<String, Future<?>> taskFutures = new ConcurrentHashMap<>();
+    private final Map<String, ExecutionCleanup> cleanupStates = new ConcurrentHashMap<>();
     private final ThreadPoolExecutor executor;
     private final ScheduledExecutorService watchdog;
 
@@ -70,13 +73,13 @@ public class McpTaskManager {
      * Create a new task manager with specified thread pool size
      */
     public McpTaskManager(int threadPoolSize) {
-        this.executor = new ThreadPoolExecutor(threadPoolSize, threadPoolSize, 0L, TimeUnit.MILLISECONDS,
-            new LinkedBlockingQueue<>(), r -> {
-                Thread t = new Thread(r);
-                t.setName("MCP-Task-" + t.threadId());
-                t.setDaemon(true);
-                return t;
-            });
+        this.executor = new ThreadPoolExecutor(threadPoolSize, threadPoolSize, 0L,
+            TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(128), r -> {
+            Thread t = new Thread(r);
+            t.setName("MCP-Task-" + t.threadId());
+            t.setDaemon(true);
+            return t;
+        }, new ThreadPoolExecutor.AbortPolicy());
         this.watchdog = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "MCP-Task-Watchdog");
             t.setDaemon(true);
@@ -115,7 +118,8 @@ public class McpTaskManager {
      */
     public McpTask submitTask(String toolName, Map<String, Object> arguments,
                                Supplier<McpSchema.CallToolResult> taskExecutor) {
-        return submitTask(toolName, arguments, DEFAULT_TASK_TIMEOUT_SECONDS, task -> taskExecutor.get());
+        return submitTask(toolName, arguments, DEFAULT_TASK_TIMEOUT_SECONDS, McpProgramContext.empty(),
+            task -> taskExecutor.get());
     }
 
     public McpTask submitTask(String toolName, Map<String, Object> arguments,
@@ -135,59 +139,121 @@ public class McpTaskManager {
         return submitTask(toolName, arguments, DEFAULT_TASK_TIMEOUT_SECONDS, programContext, taskExecutor);
     }
 
+    /** Release execution resources once, including cancellation before a worker starts. */
+    public McpTask submitTask(String toolName, Map<String, Object> arguments,
+            McpProgramContext programContext,
+            Function<McpTask, McpSchema.CallToolResult> taskExecutor, Runnable cleanup) {
+        return submitTask(toolName, arguments, DEFAULT_TASK_TIMEOUT_SECONDS, programContext,
+            taskExecutor, cleanup);
+    }
+
     public McpTask submitTask(String toolName, Map<String, Object> arguments, int timeoutSeconds,
                                Supplier<McpSchema.CallToolResult> taskExecutor) {
-        return submitTask(toolName, arguments, timeoutSeconds, task -> taskExecutor.get());
+        return submitTask(toolName, arguments, timeoutSeconds, McpProgramContext.empty(),
+            task -> taskExecutor.get());
     }
 
-    /**
-     * Submit a new async task for execution with an explicit watchdog timeout.
-     *
-     * @param timeoutSeconds clamped to [{@link #MIN_TASK_TIMEOUT_SECONDS}, {@link #MAX_TASK_TIMEOUT_SECONDS}]
-     */
     public McpTask submitTask(String toolName, Map<String, Object> arguments, int timeoutSeconds,
+                               McpProgramContext programContext,
                                Function<McpTask, McpSchema.CallToolResult> taskExecutor) {
-        return submitTask(toolName, arguments, timeoutSeconds, McpProgramContext.empty(), taskExecutor);
+        return submitTask(toolName, arguments, timeoutSeconds, programContext, taskExecutor, () -> {});
     }
 
     /**
-     * Submit a new async task for execution with an explicit watchdog timeout and an immutable
-     * snapshot of its target program (captured at submit time, so a later focus change doesn't
-     * retroactively change which program a completed task's result is decorated with).
+     * Submit a new async task with an explicit watchdog timeout and an immutable snapshot of its
+     * target program. {@code cleanup} runs exactly once, including when cancelled before start.
      *
      * @param timeoutSeconds clamped to [{@link #MIN_TASK_TIMEOUT_SECONDS}, {@link #MAX_TASK_TIMEOUT_SECONDS}]
      */
     public McpTask submitTask(String toolName, Map<String, Object> arguments, int timeoutSeconds,
                                McpProgramContext programContext,
-                               Function<McpTask, McpSchema.CallToolResult> taskExecutor) {
-        // Clean up old tasks before creating new ones
+                               Function<McpTask, McpSchema.CallToolResult> taskExecutor,
+                               Runnable cleanup) {
         cleanupOldTasks();
-
         McpTask task = new McpTask(toolName, arguments, programContext);
         task.setTimeoutSeconds(Math.max(MIN_TASK_TIMEOUT_SECONDS, Math.min(MAX_TASK_TIMEOUT_SECONDS, timeoutSeconds)));
+        ExecutionCleanup execution = new ExecutionCleanup(cleanup);
         tasks.put(task.getTaskId(), task);
-
-        Future<?> future = executor.submit(() -> {
+        cleanupStates.put(task.getTaskId(), execution);
+        FutureTask<Void> future = new FutureTask<>(() -> {
+            if (!execution.tryStart()) {
+                return null;
+            }
             try {
                 task.markStarted();
-                Msg.info(this, "Task started: " + task.getTaskId() + " for tool: " + toolName);
-
                 McpSchema.CallToolResult result = taskExecutor.apply(task);
-                task.markCompleted(result);
-
-                Msg.info(this, "Task completed: " + task.getTaskId() + " in " + task.getDurationMillis() + "ms");
-
+                if (result == null) {
+                    task.markFailed("Tool returned no result");
+                } else {
+                    task.markCompleted(result);
+                }
             } catch (Exception e) {
                 task.markFailed(e.getMessage());
-                Msg.error(this, "Task failed: " + task.getTaskId() + " - " + e.getMessage(), e);
+                Msg.error(this, "Task failed: " + task.getTaskId(), e);
+            } finally {
+                execution.cleanup();
+                cleanupStates.remove(task.getTaskId(), execution);
             }
-        });
-
+            return null;
+        }) {
+            @Override
+            protected void done() {
+                // FutureTask.cancel can run before the callable starts. The shared
+                // gate prevents releasing a program lease while that callable starts.
+                if (execution.cancelBeforeStart()) {
+                    execution.cleanup();
+                    cleanupStates.remove(task.getTaskId(), execution);
+                }
+                taskFutures.remove(task.getTaskId(), this);
+            }
+        };
         taskFutures.put(task.getTaskId(), future);
         Msg.info(this, "Task submitted: " + task.getTaskId() + " for tool: " + toolName +
             " (timeout=" + task.getTimeoutSeconds() + "s)");
 
+        try {
+            executor.execute(future);
+        } catch (RuntimeException e) {
+            task.markFailed(e.getMessage());
+            future.cancel(false);
+            tasks.remove(task.getTaskId(), task);
+            throw e;
+        }
         return task;
+    }
+
+    private static final class ExecutionCleanup {
+        private final Runnable callback;
+        private final AtomicBoolean cleaned = new AtomicBoolean();
+        private boolean started;
+        private boolean cancelled;
+
+        ExecutionCleanup(Runnable callback) {
+            this.callback = java.util.Objects.requireNonNull(callback);
+        }
+
+        synchronized boolean tryStart() {
+            if (cancelled) {
+                return false;
+            }
+            started = true;
+            return true;
+        }
+
+        synchronized boolean cancelBeforeStart() {
+            cancelled = true;
+            return !started;
+        }
+
+        void cleanup() {
+            if (cleaned.compareAndSet(false, true)) {
+                try {
+                    callback.run();
+                } catch (RuntimeException e) {
+                    Msg.error(this, "Failed to release MCP task resources", e);
+                }
+            }
+        }
     }
 
     /**
@@ -261,6 +327,7 @@ public class McpTaskManager {
         if (task == null) {
             return McpSchema.CallToolResult.builder()
                 .addTextContent("Task not found: " + taskId)
+                .isError(true)
                 .build();
         }
 
@@ -274,15 +341,21 @@ public class McpTaskManager {
             return task.getResult();
         }
 
+        if (task.getStatus() == McpTask.Status.FAILED && task.getResult() != null) {
+            return task.getResult();
+        }
+
         if (task.getStatus() == McpTask.Status.FAILED) {
             return McpSchema.CallToolResult.builder()
                 .addTextContent("Task failed: " + task.getErrorMessage())
+                .isError(true)
                 .build();
         }
 
         if (task.getStatus() == McpTask.Status.CANCELLED) {
             return McpSchema.CallToolResult.builder()
                 .addTextContent("Task was cancelled: " + task.getProgressMessage())
+                .isError(true)
                 .build();
         }
 
@@ -298,6 +371,7 @@ public class McpTaskManager {
 
         return McpSchema.CallToolResult.builder()
             .addTextContent("Unknown task state: " + task.getStatus())
+            .isError(true)
             .build();
     }
 
@@ -316,12 +390,12 @@ public class McpTaskManager {
             return false; // Can't cancel a task that already finished/failed/was cancelled
         }
 
+        task.markCancelled("Cancelled by client request");
         Future<?> future = taskFutures.get(taskId);
         if (future != null) {
             future.cancel(true);
         }
 
-        task.markCancelled("Cancelled by client request");
         Msg.info(this, "Task cancelled: " + taskId);
         return true;
     }
@@ -442,6 +516,11 @@ public class McpTaskManager {
     public void shutdown() {
         Msg.info(this, "Shutting down McpTaskManager...");
         watchdog.shutdownNow();
+        for (McpTask task : tasks.values()) {
+            if (!task.isTerminal()) {
+                cancelTask(task.getTaskId());
+            }
+        }
         executor.shutdown();
         try {
             if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
