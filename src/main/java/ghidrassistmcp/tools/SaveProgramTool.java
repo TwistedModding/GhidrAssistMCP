@@ -9,6 +9,8 @@ import ghidra.framework.model.DomainFile;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.listing.Program;
 import ghidra.util.Msg;
+import ghidra.util.Swing;
+import ghidra.util.task.TaskMonitor;
 import ghidrassistmcp.GhidrAssistMCPBackend;
 import ghidrassistmcp.GhidrAssistMCPManager;
 import ghidrassistmcp.McpTool;
@@ -65,12 +67,12 @@ public class SaveProgramTool implements McpTool {
         GhidrAssistMCPManager manager = GhidrAssistMCPManager.getInstance();
         PluginTool pluginTool = manager.getActiveTool();
         if (pluginTool == null) {
-            return textResult("No active Ghidra tool/window available.");
+            return textResult("No active Ghidra tool/window available.", true);
         }
 
         ProgramManager programManager = pluginTool.getService(ProgramManager.class);
         if (programManager == null) {
-            return textResult("ProgramManager service not available. Is CodeBrowser open?");
+            return textResult("ProgramManager service not available. Is CodeBrowser open?", true);
         }
 
         String name = stringArg(arguments.get("name"), null);
@@ -78,29 +80,40 @@ public class SaveProgramTool implements McpTool {
             resolveOpenProgram(programManager.getAllOpenPrograms(), name);
         if (target == null) {
             if (name == null) {
-                return textResult("No current program is open.");
+                return textResult("No current program is open.", true);
             }
-            return textResult("Open program not found: " + name);
+            return textResult("Open program not found: " + name, true);
         }
 
         String label = describeProgram(target);
         if (!target.isChanged()) {
-            return textResult("No unsaved changes: " + label);
+            return textResult("No unsaved changes: " + label, false);
         }
 
+        return save(target, label, () -> Swing.runNow(() -> pluginTool.prepareToSave(target)));
+    }
+
+    /** Saves on the calling thread and reports the finished outcome. */
+    static McpSchema.CallToolResult save(Program target, String label, Runnable prepareToSave) {
+        Object consumer = new Object();
+        if (!target.addConsumer(consumer)) {
+            return textResult("Program was closed before it could be saved: " + label, true);
+        }
         try {
-            programManager.saveProgram(target);
+            prepareToSave.run();
+            target.getDomainFile().save(TaskMonitor.DUMMY);
         } catch (Exception e) {
-            Msg.error(this, "Failed to save program: " + label, e);
+            Msg.error(SaveProgramTool.class, "Failed to save program: " + label, e);
             return textResult("Failed to save " + label + ": " +
-                e.getClass().getSimpleName() + ": " + e.getMessage());
+                e.getClass().getSimpleName() + ": " + e.getMessage(), true);
+        } finally {
+            target.release(consumer);
         }
 
         if (target.isChanged()) {
-            return textResult("Save did not complete: " + label + " still reports unsaved changes.");
+            return textResult("Save did not complete: " + label + " still reports unsaved changes.", true);
         }
-
-        return textResult("Saved: " + label);
+        return textResult("Saved: " + label, false);
     }
 
     private Program resolveOpenProgram(Program[] openPrograms, String name) {
@@ -156,9 +169,10 @@ public class SaveProgramTool implements McpTool {
         return defaultValue;
     }
 
-    private McpSchema.CallToolResult textResult(String message) {
+    private static McpSchema.CallToolResult textResult(String message, boolean error) {
         return McpSchema.CallToolResult.builder()
             .addTextContent(message)
+            .isError(error)
             .build();
     }
 }

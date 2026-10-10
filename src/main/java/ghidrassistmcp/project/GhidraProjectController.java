@@ -1,6 +1,7 @@
 package ghidrassistmcp.project;
 
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -21,6 +22,7 @@ import ghidra.framework.main.FrontEndTool;
 import ghidra.framework.model.DomainFile;
 import ghidra.framework.model.DomainObject;
 import ghidra.framework.model.Project;
+import ghidra.framework.model.ProjectListener;
 import ghidra.framework.model.ProjectLocator;
 import ghidra.framework.model.ProjectManager;
 import ghidra.framework.options.SaveState;
@@ -91,10 +93,12 @@ public final class GhidraProjectController implements ProjectController {
     }
 
     private void attach(Project project) throws Exception {
+        boolean announced = false;
         try {
             if (host.projectManager().getActiveProject() != project || project.isClosed()) {
                 throw new IllegalStateException("The active Ghidra project changed before it could be displayed");
             }
+            announced = true;
             host.setActiveProject(project);
         } catch (Exception error) {
             // Release the newly acquired project lock if UI attachment fails.
@@ -102,11 +106,26 @@ public final class GhidraProjectController implements ProjectController {
             if (!project.isClosed()) {
                 try { project.close(); } catch (RuntimeException cleanup) { error.addSuppressed(cleanup); }
             }
-            if (stillActive) {
+            if (announced) {
+                try { fireProjectClosed(project, host.projectListeners()); }
+                catch (RuntimeException cleanup) { error.addSuppressed(cleanup); }
+            }
+            if (announced || stillActive) {
                 try { host.setActiveProject(null); } catch (Exception cleanup) { error.addSuppressed(cleanup); }
             }
             throw error;
         }
+    }
+
+    private static void fireProjectClosed(Project project, Iterable<ProjectListener> listeners) {
+        RuntimeException failure = null;
+        for (ProjectListener listener : listeners) {
+            try { listener.projectClosed(project); }
+            catch (RuntimeException error) {
+                if (failure == null) failure = error; else failure.addSuppressed(error);
+            }
+        }
+        if (failure != null) throw failure;
     }
 
     @Override
@@ -165,12 +184,17 @@ public final class GhidraProjectController implements ProjectController {
                         || host.hasUnsavedPluginData(project))) {
                     throw new IllegalStateException("Project or tool plugin data remains unsaved. Save it in Ghidra before closing, or use discard_changes=true. The project remains open.");
                 }
+                Iterable<ProjectListener> listeners = host.projectListeners();
                 project.close();
                 if (!project.isClosed()) {
                     throw new IllegalStateException("Ghidra did not close the project");
                 }
-                host.setActiveProject(null);
-                host.projectManager().setLastOpenedProject(null);
+                try {
+                    fireProjectClosed(project, listeners);
+                } finally {
+                    host.setActiveProject(null);
+                    host.projectManager().setLastOpenedProject(null);
+                }
                 return null;
             });
             result.put("saved_files", saved);
@@ -410,12 +434,25 @@ public final class GhidraProjectController implements ProjectController {
         <T> T onEdt(CheckedSupplier<T> action) throws Exception;
         ProjectManager projectManager();
         void setActiveProject(Project project);
+        Iterable<ProjectListener> projectListeners();
         boolean hasRunningCommands(Project project);
         boolean hasUnsavedToolConfiguration(Project project);
         boolean hasUnsavedPluginData(Project project);
     }
 
+    static Method projectListenersAccessor() {
+        try {
+            Method method = FrontEndTool.class.getDeclaredMethod("getListeners");
+            if (!Iterable.class.isAssignableFrom(method.getReturnType())) return null;
+            method.setAccessible(true);
+            return method;
+        } catch (ReflectiveOperationException | RuntimeException unavailable) {
+            return null;
+        }
+    }
+
     private static final class FrontEndHost implements Host {
+        private static final Method LISTENERS = projectListenersAccessor();
         private final Supplier<FrontEndTool> owner;
         FrontEndHost(Supplier<FrontEndTool> owner) { this.owner = java.util.Objects.requireNonNull(owner); }
         private FrontEndTool owner() {
@@ -425,6 +462,18 @@ public final class GhidraProjectController implements ProjectController {
         }
         @Override public ProjectManager projectManager() { return owner().getProjectManager(); }
         @Override public void setActiveProject(Project project) { owner().setActiveProject(project); }
+        @SuppressWarnings("unchecked")
+        @Override public Iterable<ProjectListener> projectListeners() {
+            if (LISTENERS == null) {
+                throw new IllegalStateException("This Ghidra version does not expose project-close listeners. "
+                    + "Close the project from Ghidra's File menu.");
+            }
+            try {
+                return (Iterable<ProjectListener>) LISTENERS.invoke(owner());
+            } catch (ReflectiveOperationException error) {
+                throw new IllegalStateException("Could not read Ghidra's project listeners; the project remains open", error);
+            }
+        }
         @Override public boolean hasRunningCommands(Project project) {
             if (owner().isExecutingCommand()) return true;
             for (var tool : project.getToolManager().getRunningTools()) {

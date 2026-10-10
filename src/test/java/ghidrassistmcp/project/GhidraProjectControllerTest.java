@@ -20,11 +20,13 @@ import org.junit.jupiter.api.io.TempDir;
 import ghidra.framework.model.DomainFile;
 import ghidra.framework.model.DomainObject;
 import ghidra.framework.model.Project;
+import ghidra.framework.model.ProjectListener;
 import ghidra.framework.model.ProjectLocator;
 import ghidra.framework.model.ProjectManager;
 import ghidra.framework.model.ToolManager;
 import ghidra.framework.model.Workspace;
 import ghidra.framework.options.SaveState;
+import ghidra.util.exception.AssertException;
 
 class GhidraProjectControllerTest {
     @TempDir Path directory;
@@ -88,6 +90,50 @@ class GhidraProjectControllerTest {
         assertTrue(host.lastCreated.closed);
         assertSame(replacement, host.current);
         assertFalse(replacement.closed);
+        assertNull(host.snapshots.current);
+        assertNull(host.displayed);
+    }
+
+    @Test void createCloseOpenNotifiesProjectListenersLikeGhidrasClose() throws Exception {
+        FakeHost host = new FakeHost();
+        GhidraProjectController controller = new GhidraProjectController(host);
+        controller.createProject(directory.toString(), "cycle");
+        Project created = host.current.project;
+        assertSame(created, host.snapshots.current);
+        assertEquals("closed", controller.closeProject(false, false).get("status"));
+        assertEquals(List.of(created), host.snapshots.closed);
+        assertNull(host.snapshots.current);
+        assertEquals("opened", controller.openProject(directory.toString(), "cycle", false).get("status"));
+        assertSame(host.current.project, host.snapshots.current);
+    }
+
+    @Test void openCloseOpenNotifiesProjectListenersLikeGhidrasClose() throws Exception {
+        FakeHost host = new FakeHost();
+        new FakeProject(host, "reopen").makeFiles();
+        GhidraProjectController controller = new GhidraProjectController(host);
+        controller.openProject(directory.toString(), "reopen", false);
+        Project first = host.current.project;
+        controller.closeProject(false, false);
+        controller.openProject(directory.toString(), "reopen", false);
+        assertEquals(List.of(first), host.snapshots.closed);
+        assertSame(host.current.project, host.snapshots.current);
+        assertNotSame(first, host.snapshots.current);
+    }
+
+    @Test void closeIsRefusedBeforeClosingWhenListenersCannotBeNotified() throws Exception {
+        FakeHost host = new FakeHost();
+        GhidraProjectController controller = new GhidraProjectController(host);
+        controller.createProject(directory.toString(), "unnotifiable");
+        FakeProject project = host.current;
+        host.listenersUnavailable = true;
+        assertThrows(IllegalStateException.class, () -> controller.closeProject(false, false));
+        assertFalse(project.closed);
+        assertSame(project.project, host.displayed);
+        assertSame(project.project, host.snapshots.current);
+    }
+
+    @Test void ghidraFrontEndStillExposesItsProjectListeners() {
+        assertNotNull(GhidraProjectController.projectListenersAccessor());
     }
 
     @Test void saveCoversAllDomainObjectTypesOffEdtAndVerifiesMetadataCheckpoint() throws Exception {
@@ -314,8 +360,9 @@ class GhidraProjectControllerTest {
         Project displayed;
         Object repository;
         int creates, opens, lastOpenedClears;
-        boolean onEdt, busy, configDirty, pluginDirty, remember, restore, resetOwner;
+        boolean onEdt, busy, configDirty, pluginDirty, remember, restore, resetOwner, listenersUnavailable;
         Runnable attachFailure;
+        final SnapshotListener snapshots = new SnapshotListener();
         final ProjectManager manager = proxy(ProjectManager.class, (object, method, args) -> {
             assertTrue(onEdt, method.getName());
             return switch (method.getName()) {
@@ -353,14 +400,36 @@ class GhidraProjectControllerTest {
             try { return action.get(); } finally { onEdt = previous; }
         }
         @Override public ProjectManager projectManager() { assertTrue(onEdt); return manager; }
+        // FrontEndTool.setActiveProject announces non-null projects but never fires projectClosed.
         @Override public void setActiveProject(Project project) {
             assertTrue(onEdt);
-            if (project != null && attachFailure != null) attachFailure.run();
             displayed = project;
+            if (project != null) snapshots.projectOpened(project);
+            if (project != null && attachFailure != null) attachFailure.run();
+        }
+        @Override public Iterable<ProjectListener> projectListeners() {
+            assertTrue(onEdt);
+            if (listenersUnavailable) throw new IllegalStateException("listeners unavailable");
+            return List.of(snapshots);
         }
         @Override public boolean hasRunningCommands(Project project) { assertTrue(onEdt); return busy; }
         @Override public boolean hasUnsavedToolConfiguration(Project project) { assertTrue(onEdt); return configDirty; }
         @Override public boolean hasUnsavedPluginData(Project project) { assertTrue(onEdt); return pluginDirty; }
+    }
+
+    /** Same single-project invariant as RecoverySnapshotMgrPlugin. */
+    private static final class SnapshotListener implements ProjectListener {
+        Project current;
+        final List<Project> closed = new ArrayList<>();
+        @Override public void projectOpened(Project project) {
+            if (project == current) return;
+            if (current != null) throw new AssertException("Unexpected - two or more projects active");
+            current = project;
+        }
+        @Override public void projectClosed(Project project) {
+            closed.add(project);
+            current = null;
+        }
     }
 
     private final class FakeProject {
