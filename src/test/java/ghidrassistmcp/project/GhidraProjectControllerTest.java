@@ -22,6 +22,8 @@ import ghidra.framework.model.DomainObject;
 import ghidra.framework.model.Project;
 import ghidra.framework.model.ProjectLocator;
 import ghidra.framework.model.ProjectManager;
+import ghidra.framework.model.ToolManager;
+import ghidra.framework.model.Workspace;
 import ghidra.framework.options.SaveState;
 
 class GhidraProjectControllerTest {
@@ -67,6 +69,14 @@ class GhidraProjectControllerTest {
         assertEquals(1, host.opens);
         assertThrows(IllegalStateException.class, () -> controller.openProject(directory.toString(), "other", false));
         assertSame(host.current.project, host.displayed);
+    }
+
+    @Test void openWithoutRestoredStateCreatesTheDefaultWorkspace() throws Exception {
+        FakeHost host = new FakeHost();
+        new FakeProject(host, "plain").makeFiles();
+        GhidraProjectController controller = new GhidraProjectController(host);
+        assertEquals("opened", controller.openProject(directory.toString(), "plain", false).get("status"));
+        assertNotNull(host.current.workspace);
     }
 
     @Test void attachmentFailureReleasesNewProjectAndPreservesAnyNewerActiveProject() throws Exception {
@@ -358,12 +368,18 @@ class GhidraProjectControllerTest {
         final ProjectLocator locator;
         final List<DomainFile> openFiles = new ArrayList<>();
         SaveState checkpoint;
+        Workspace workspace;
         int metadataSaves;
         boolean closed, metadataDirty, swallowMetadataWrite;
         final Project project;
         private Project createProxy() { return proxy(Project.class, (object, method, args) -> switch (method.getName()) {
             case "getName" -> locator.getName();
             case "getProjectLocator" -> locator;
+            case "getToolManager" -> proxy(ToolManager.class, (tm, m, a) -> switch (m.getName()) {
+                case "getActiveWorkspace" -> workspace;
+                case "createWorkspace" -> workspace = proxy(Workspace.class, (w, wm, wa) -> a[0]);
+                default -> throw new UnsupportedOperationException(m.getName());
+            });
             case "isClosed" -> closed;
             case "hasChanged" -> { assertTrue(host.onEdt); yield metadataDirty; }
             case "getOpenData" -> { assertTrue(host.onEdt); yield List.copyOf(openFiles); }

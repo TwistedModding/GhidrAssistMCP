@@ -81,6 +81,10 @@ public final class GhidraProjectController implements ProjectController {
             if (opened == null) {
                 throw new IOException("Ghidra did not open the project: " + locator.getMarkerFile());
             }
+            // Without restored state there is no workspace, and the project window rejects that.
+            if (opened.getToolManager().getActiveWorkspace() == null) {
+                opened.getToolManager().createWorkspace("Workspace");
+            }
             attach(opened);
             return result(opened, "opened");
         });
