@@ -23,9 +23,8 @@ import ghidra.framework.model.Project;
 import ghidra.framework.model.ProjectListener;
 import ghidra.framework.model.ProjectLocator;
 import ghidra.framework.model.ProjectManager;
-import ghidra.framework.model.ToolManager;
-import ghidra.framework.model.Workspace;
 import ghidra.framework.options.SaveState;
+import ghidra.framework.project.tool.ToolManagerImpl;
 import ghidra.util.exception.AssertException;
 
 class GhidraProjectControllerTest {
@@ -73,12 +72,13 @@ class GhidraProjectControllerTest {
         assertSame(host.current.project, host.displayed);
     }
 
-    @Test void openWithoutRestoredStateCreatesTheDefaultWorkspace() throws Exception {
+    @Test void openWithoutRestoredStateCreatesACleanDefaultWorkspace() throws Exception {
         FakeHost host = new FakeHost();
         new FakeProject(host, "plain").makeFiles();
         GhidraProjectController controller = new GhidraProjectController(host);
         assertEquals("opened", controller.openProject(directory.toString(), "plain", false).get("status"));
-        assertNotNull(host.current.workspace);
+        assertNotNull(host.current.tools.getActiveWorkspace());
+        assertFalse(host.onEdt(() -> host.current.project.hasChanged()));
     }
 
     @Test void attachmentFailureReleasesNewProjectAndPreservesAnyNewerActiveProject() throws Exception {
@@ -437,20 +437,17 @@ class GhidraProjectControllerTest {
         final ProjectLocator locator;
         final List<DomainFile> openFiles = new ArrayList<>();
         SaveState checkpoint;
-        Workspace workspace;
+        final ToolManagerImpl tools;
         int metadataSaves;
         boolean closed, metadataDirty, swallowMetadataWrite;
         final Project project;
         private Project createProxy() { return proxy(Project.class, (object, method, args) -> switch (method.getName()) {
             case "getName" -> locator.getName();
             case "getProjectLocator" -> locator;
-            case "getToolManager" -> proxy(ToolManager.class, (tm, m, a) -> switch (m.getName()) {
-                case "getActiveWorkspace" -> workspace;
-                case "createWorkspace" -> workspace = proxy(Workspace.class, (w, wm, wa) -> a[0]);
-                default -> throw new UnsupportedOperationException(m.getName());
-            });
+            case "getToolManager" -> tools;
+            case "getLocalToolChest" -> null;
             case "isClosed" -> closed;
-            case "hasChanged" -> { assertTrue(host.onEdt); yield metadataDirty; }
+            case "hasChanged" -> { assertTrue(host.onEdt); yield metadataDirty || tools.hasChanged(); }
             case "getOpenData" -> { assertTrue(host.onEdt); yield List.copyOf(openFiles); }
             case "setSaveableData" -> { assertTrue(host.onEdt); checkpoint = (SaveState) args[1]; yield null; }
             case "getSaveableData" -> { assertTrue(host.onEdt); yield checkpoint; }
@@ -475,6 +472,7 @@ class GhidraProjectControllerTest {
             this.host = host;
             locator = new ProjectLocator(directory.toString(), name);
             project = createProxy();
+            tools = new ToolManagerImpl(project);
         }
         void makeFiles() throws IOException {
             Files.createDirectories(locator.getProjectDir().toPath());

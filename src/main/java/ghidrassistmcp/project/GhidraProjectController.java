@@ -25,7 +25,9 @@ import ghidra.framework.model.Project;
 import ghidra.framework.model.ProjectListener;
 import ghidra.framework.model.ProjectLocator;
 import ghidra.framework.model.ProjectManager;
+import ghidra.framework.model.ToolManager;
 import ghidra.framework.options.SaveState;
+import ghidra.framework.project.tool.ToolManagerImpl;
 import ghidra.util.SystemUtilities;
 import ghidra.util.task.TaskMonitor;
 
@@ -84,8 +86,12 @@ public final class GhidraProjectController implements ProjectController {
                 throw new IOException("Ghidra did not open the project: " + locator.getMarkerFile());
             }
             // Without restored state there is no workspace, and the project window rejects that.
-            if (opened.getToolManager().getActiveWorkspace() == null) {
-                opened.getToolManager().createWorkspace("Workspace");
+            ToolManager tools = opened.getToolManager();
+            if (tools.getActiveWorkspace() == null) {
+                tools.createWorkspace(ToolManager.DEFAULT_WORKSPACE_NAME);
+                if (tools instanceof ToolManagerImpl impl) {
+                    impl.clearWorkspaceChanged();
+                }
             }
             attach(opened);
             return result(opened, "opened");
